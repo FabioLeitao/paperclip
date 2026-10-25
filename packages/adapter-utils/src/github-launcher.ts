@@ -7,6 +7,25 @@ const os = require('node:os');
 const { spawn, spawnSync } = require('node:child_process');
 const directory = path.dirname(fs.realpathSync(process.argv[1]));
 const program = path.basename(process.argv[1]);
+const SIGNING_KEYS = '^(commit|tag)\\.gpgsign$|^gpg\\.format$|^gpg\\.ssh\\.allowedsignersfile$|^user\\.signingkey$';
+const SIGNING_SUBCOMMANDS = new Set(['commit', 'tag', 'merge', 'rebase', 'cherry-pick', 'revert', 'am', 'pull']);
+// Finds the subcommand and the options that choose the repository a command runs in, so the
+// signing lookup is evaluated in the same context (includeIf rules depend on it).
+function parseGitInvocation(args) {
+  const lookup = [];
+  const valued = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix', '--attr-source']);
+  const targeting = new Set(['-C', '--git-dir', '--work-tree']);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith('-')) return { lookup, subcommand: arg };
+    if (valued.has(arg)) {
+      if (targeting.has(arg) && i + 1 < args.length) lookup.push(arg, args[i + 1]);
+      i += 1;
+    } else if (/^--(git-dir|work-tree)=/.test(arg)) lookup.push(arg);
+  }
+  return { lookup, subcommand: '' };
+}
+const invocation = program === 'git' ? parseGitInvocation(process.argv.slice(2)) : { lookup: [], subcommand: '' };
 const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => {
   try { return fs.realpathSync(p) !== directory; } catch { return true; }
 });
@@ -102,41 +121,72 @@ async function main() {
   // Honour the commit-signing configuration of the account that owns this machine, so that
   // enabling managed GitHub credentials never turns signed commits into unsigned ones.
   // Only these non-executable keys are read, from the real account home (adapters may
-  // redirect $HOME), and they are applied as command-scope config after the managed entries.
+  // redirect $HOME) and in the repository context of the requested command. They go into a
+  // scratch global config, so repository configuration keeps its normal precedence over them.
+  let signingUnreadable = false;
   try {
     const gitBinary = program === 'git' ? executable : originalPath.map(p => path.join(p, 'git')).find(p => {
       try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; }
     });
     const accountHome = ${JSON.stringify(options.accountHome ?? null)} || os.userInfo().homedir;
     if (gitBinary && accountHome) {
-      const read = spawnSync(gitBinary, ['config', '--global', '--includes', '--null', '--type=path', '--get-regexp',
-        '^(commit|tag)\\.gpgsign$|^gpg\\.format$|^gpg\\.ssh\\.allowedsignersfile$|^user\\.signingkey$'], {
-        env: { PATH: originalPath.join(path.delimiter), HOME: accountHome, LC_ALL: 'C', GIT_CONFIG_NOSYSTEM: '1' },
-        encoding: 'utf8', timeout: 5000,
-      });
-      if (read.status === 0 && read.stdout) {
-        const entries = [];
+      const lookupEnv = { PATH: originalPath.join(path.delimiter), HOME: accountHome, LC_ALL: 'C', GIT_CONFIG_NOSYSTEM: '1' };
+      // Git reads $XDG_CONFIG_HOME/git/config next to ~/.gitconfig; an isolated directory has none.
+      if (process.env.XDG_CONFIG_HOME) lookupEnv.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
+      const read = spawnSync(gitBinary, [...invocation.lookup, 'config', '--global', '--includes', '--null', '--get-regexp', SIGNING_KEYS],
+        { env: lookupEnv, encoding: 'utf8', timeout: 5000 });
+      if (read.error || (read.status !== 0 && read.status !== 1)) {
+        signingUnreadable = true; // status 1 only means that no signing key is configured
+      } else if (read.status === 0 && read.stdout) {
+        const settings = new Map();
         for (const record of read.stdout.split('\0')) {
+          if (!record) continue;
           const at = record.indexOf('\n');
-          if (at > 0) entries.push([record.slice(0, at), record.slice(at + 1)]);
+          // A key written without a value is a Git boolean and means true.
+          settings.set(at < 0 ? record : record.slice(0, at), at < 0 ? 'true' : record.slice(at + 1));
+        }
+        for (const key of ['gpg.ssh.allowedsignersfile', 'user.signingkey']) {
+          const value = settings.get(key);
+          if (value && value.startsWith('~/')) settings.set(key, path.join(accountHome, value.slice(2)));
         }
         // A public-key path relies on ssh-agent, which this launcher deliberately does not
         // inherit; use the matching private key file when it is readable.
-        for (const entry of entries) {
-          if (entry[0] !== 'user.signingkey' || !entry[1].endsWith('.pub')) continue;
-          try { fs.accessSync(entry[1].slice(0, -4), fs.constants.R_OK); entry[1] = entry[1].slice(0, -4); } catch {}
+        const signingKey = settings.get('user.signingkey');
+        if (signingKey && signingKey.endsWith('.pub')) {
+          try { fs.accessSync(signingKey.slice(0, -4), fs.constants.R_OK); settings.set('user.signingkey', signingKey.slice(0, -4)); } catch {}
         }
-        let count = Number(env.GIT_CONFIG_COUNT || '0');
-        if (!Number.isInteger(count) || count < 0) count = 0;
-        for (const [key, value] of entries) {
-          env['GIT_CONFIG_KEY_' + count] = key;
-          env['GIT_CONFIG_VALUE_' + count] = value;
-          count += 1;
+        // OpenPGP keys live under the account's GnuPG home, which a redirected $HOME hides.
+        const signs = ['commit.gpgsign', 'tag.gpgsign'].some(key => /^(true|yes|on|1)$/i.test(settings.get(key) || ''));
+        const format = settings.get('gpg.format');
+        const gnupgHome = path.join(accountHome, '.gnupg');
+        if (signs && (!format || format === 'openpgp') && !env.GNUPGHOME && fs.existsSync(gnupgHome)) env.GNUPGHOME = gnupgHome;
+        if (!configReady) {
+          signingUnreadable = true;
+        } else {
+          const quote = value => '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n') + '"';
+          const lines = [];
+          for (const [key, value] of settings) {
+            const parts = key.split('.');
+            const name = parts.pop();
+            const section = parts.shift();
+            lines.push(parts.length ? '[' + section + ' "' + parts.join('.') + '"]' : '[' + section + ']', '\t' + name + ' = ' + quote(value));
+          }
+          const file = path.join(configDirectory, 'signing.gitconfig');
+          fs.writeFileSync(file, lines.join('\n') + '\n', { mode: 0o600 });
+          env.GIT_CONFIG_GLOBAL = file;
         }
-        env.GIT_CONFIG_COUNT = String(count);
-      } else if (read.status !== 0 && read.status !== 1) { diagnostic('signing_configuration_unreadable'); }
+      }
     }
-  } catch { diagnostic('signing_configuration_unreadable'); }
+  } catch { signingUnreadable = true; }
+  if (signingUnreadable) {
+    process.stderr.write('Paperclip: the account commit-signing configuration could not be read.\n');
+    // A lookup failure is not the same as "no signing configured": never create an unsigned object.
+    if (SIGNING_SUBCOMMANDS.has(invocation.subcommand)) {
+      process.stderr.write('Paperclip: refusing to run git ' + invocation.subcommand + ' without it.\n');
+      process.exitCode = 1;
+      return;
+    }
+  }
   // Only this invocation and its children inherit the captured credential.
   // Its Git children use the real binary, so steering cannot split a gh operation.
   env.PATH = originalPath.join(path.delimiter);
