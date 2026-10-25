@@ -272,8 +272,10 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
       const { accountHome, repo, git } = await signingFixture();
       await writeFile(path.join(accountHome, ".gitconfig"), "[commit\n");
       await expect(git(["commit", "--allow-empty", "-m", "Managed work"])).rejects.toThrow(/signing configuration/);
+      await exec("git", ["-C", repo, "config", "alias.ci", "commit"]);
+      await expect(git(["ci", "--allow-empty", "-m", "Managed work"])).rejects.toThrow(/signing configuration/);
       await expect(exec("git", ["-C", repo, "rev-parse", "--verify", "HEAD"])).rejects.toThrow();
-      expect((await git(["status", "--porcelain"])).stdout).toBe(""); // unrelated Git still works
+      expect((await git(["status", "--porcelain"])).stdout).toBe(""); // commands that create no objects still work
     }, 15_000);
 
     it("points OpenPGP signing at the account's GnuPG home", async () => {
@@ -285,8 +287,13 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
       await mkdir(stub);
       const realGit = (await exec("sh", ["-c", "command -v git"])).stdout.trim();
       await writeFile(path.join(stub, "git"), `#!/bin/sh\ncase " $* " in *" config "*) exec ${realGit} "$@";; esac\necho "GNUPGHOME=$GNUPGHOME"\n`, { mode: 0o700 });
-      const out = await exec(path.join(bin, "git"), ["version"], { cwd: repo, env: { ...env, PATH: `${bin}:${stub}:${process.env.PATH}` } });
-      expect(out.stdout.trim()).toBe(`GNUPGHOME=${path.join(accountHome, ".gnupg")}`);
+      const hermetic: NodeJS.ProcessEnv = { ...env };
+      delete hermetic.GNUPGHOME; // do not inherit the developer's GnuPG home
+      const run = (extra: NodeJS.ProcessEnv) => exec(path.join(bin, "git"), ["version"],
+        { cwd: repo, env: { ...hermetic, PATH: `${bin}:${stub}:${process.env.PATH}`, ...extra } });
+      expect((await run({})).stdout.trim()).toBe(`GNUPGHOME=${path.join(accountHome, ".gnupg")}`);
+      // An explicit GnuPG home is the account's choice and is never replaced.
+      expect((await run({ GNUPGHOME: "/explicit/gnupg" })).stdout.trim()).toBe("GNUPGHOME=/explicit/gnupg");
     }, 15_000);
   });
 });

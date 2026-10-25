@@ -88,8 +88,9 @@ account names. When `user.signingkey` names a public key (`*.pub`) and the match
 is readable, the launcher uses that file, because it deliberately does not inherit `ssh-agent`. A key
 that needs a passphrase cannot be used without an agent: the commit then fails and does not become
 unsigned. If the account's signing configuration cannot be read (a broken file, a timeout, an
-unwritable scratch directory), `commit`, `tag`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`
-and `pull` are refused instead of silently creating unsigned objects; other commands still run. An
+unwritable scratch directory), Git commands outside a short list that never create commits or tags
+(`status`, `diff`, `log`, `fetch`, `push`, `checkout`, ...) are refused instead of silently creating
+unsigned objects. Aliases and unknown subcommands are refused too, because they can create commits. An
 account without signing settings keeps today's behavior (unsigned commits).
 
 Scripts that previously read a persistent `GH_TOKEN` must use managed `git`, `gh`, or GitHub gateway tools. Managed execution skips legacy GitHub token bindings in agent, environment, project, and routine configuration before secret preflight. Configure personal or dedicated access through the GitHub connection instead. Directly invoking an unmanaged executable or retaining a token obtained during an earlier invocation is outside the managed invocation contract.

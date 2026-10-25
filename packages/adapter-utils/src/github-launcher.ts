@@ -8,7 +8,12 @@ const { spawn, spawnSync } = require('node:child_process');
 const directory = path.dirname(fs.realpathSync(process.argv[1]));
 const program = path.basename(process.argv[1]);
 const SIGNING_KEYS = '^(commit|tag)\\.gpgsign$|^gpg\\.format$|^gpg\\.ssh\\.allowedsignersfile$|^user\\.signingkey$';
-const SIGNING_SUBCOMMANDS = new Set(['commit', 'tag', 'merge', 'rebase', 'cherry-pick', 'revert', 'am', 'pull']);
+// Without the account's signing policy only commands that never create commits or tags may run.
+// Aliases and unknown subcommands can create them, so they are refused too.
+const SAFE_WITHOUT_SIGNING = new Set(['add', 'archive', 'blame', 'branch', 'bundle', 'cat-file', 'check-ignore', 'checkout', 'clean',
+  'clone', 'config', 'describe', 'diff', 'fetch', 'for-each-ref', 'grep', 'help', 'init', 'log', 'ls-files', 'ls-remote',
+  'ls-tree', 'merge-base', 'mv', 'push', 'remote', 'reset', 'restore', 'rev-list', 'rev-parse', 'rm', 'show', 'show-ref',
+  'sparse-checkout', 'status', 'submodule', 'switch', 'var', 'version', 'worktree']);
 // Finds the subcommand and the options that choose the repository a command runs in, so the
 // signing lookup is evaluated in the same context (includeIf rules depend on it).
 function parseGitInvocation(args) {
@@ -181,7 +186,7 @@ async function main() {
   if (signingUnreadable) {
     process.stderr.write('Paperclip: the account commit-signing configuration could not be read.\n');
     // A lookup failure is not the same as "no signing configured": never create an unsigned object.
-    if (SIGNING_SUBCOMMANDS.has(invocation.subcommand)) {
+    if (invocation.subcommand && !SAFE_WITHOUT_SIGNING.has(invocation.subcommand)) {
       process.stderr.write('Paperclip: refusing to run git ' + invocation.subcommand + ' without it.\n');
       process.exitCode = 1;
       return;
