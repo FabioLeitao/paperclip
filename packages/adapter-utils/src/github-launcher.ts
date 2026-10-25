@@ -1,10 +1,10 @@
 /** Standalone source is staged unchanged on local, SSH, and sandbox runtimes. No secrets in files. */
-export function githubLauncherSource(): string {
+export function githubLauncherSource(options: { accountHome?: string } = {}): string {
   return String.raw`#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const directory = path.dirname(fs.realpathSync(process.argv[1]));
 const program = path.basename(process.argv[1]);
 const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => {
@@ -99,6 +99,44 @@ async function main() {
     } else { diagnostic('capability_missing'); }
     } catch { diagnostic('broker_transport_unavailable'); }
   }
+  // Honour the commit-signing configuration of the account that owns this machine, so that
+  // enabling managed GitHub credentials never turns signed commits into unsigned ones.
+  // Only these non-executable keys are read, from the real account home (adapters may
+  // redirect $HOME), and they are applied as command-scope config after the managed entries.
+  try {
+    const gitBinary = program === 'git' ? executable : originalPath.map(p => path.join(p, 'git')).find(p => {
+      try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; }
+    });
+    const accountHome = ${JSON.stringify(options.accountHome ?? null)} || os.userInfo().homedir;
+    if (gitBinary && accountHome) {
+      const read = spawnSync(gitBinary, ['config', '--global', '--includes', '--null', '--type=path', '--get-regexp',
+        '^(commit|tag)\\.gpgsign$|^gpg\\.format$|^gpg\\.ssh\\.allowedsignersfile$|^user\\.signingkey$'], {
+        env: { PATH: originalPath.join(path.delimiter), HOME: accountHome, LC_ALL: 'C', GIT_CONFIG_NOSYSTEM: '1' },
+        encoding: 'utf8', timeout: 5000,
+      });
+      if (read.status === 0 && read.stdout) {
+        const entries = [];
+        for (const record of read.stdout.split('\0')) {
+          const at = record.indexOf('\n');
+          if (at > 0) entries.push([record.slice(0, at), record.slice(at + 1)]);
+        }
+        // A public-key path relies on ssh-agent, which this launcher deliberately does not
+        // inherit; use the matching private key file when it is readable.
+        for (const entry of entries) {
+          if (entry[0] !== 'user.signingkey' || !entry[1].endsWith('.pub')) continue;
+          try { fs.accessSync(entry[1].slice(0, -4), fs.constants.R_OK); entry[1] = entry[1].slice(0, -4); } catch {}
+        }
+        let count = Number(env.GIT_CONFIG_COUNT || '0');
+        if (!Number.isInteger(count) || count < 0) count = 0;
+        for (const [key, value] of entries) {
+          env['GIT_CONFIG_KEY_' + count] = key;
+          env['GIT_CONFIG_VALUE_' + count] = value;
+          count += 1;
+        }
+        env.GIT_CONFIG_COUNT = String(count);
+      } else if (read.status !== 0 && read.status !== 1) { diagnostic('signing_configuration_unreadable'); }
+    }
+  } catch { diagnostic('signing_configuration_unreadable'); }
   // Only this invocation and its children inherit the captured credential.
   // Its Git children use the real binary, so steering cannot split a gh operation.
   env.PATH = originalPath.join(path.delimiter);

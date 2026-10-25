@@ -182,4 +182,29 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(env.GH_TOKEN).toBe("");
     expect(env.GIT_AUTHOR_NAME).toBe("");
   });
+
+  it.each([true, false])("applies the account's commit-signing config to managed Git (signing enabled: %s)", async (signing) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-signing-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const accountHome = path.join(root, "account");
+    const bin = path.join(root, "managed");
+    await mkdir(path.join(accountHome, ".ssh"), { recursive: true });
+    await mkdir(bin);
+    const key = path.join(accountHome, ".ssh", "id_ed25519");
+    await exec("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", key]);
+    // The account config names the PUBLIC key, as ssh-agent users do; the agent is not inherited.
+    await writeFile(path.join(accountHome, ".gitconfig"), signing
+      ? `[commit]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = ${key}.pub\n`
+      : "[user]\n\tname = Account\n");
+    await exec("git", ["init", root]);
+    await exec("git", ["-C", root, "config", "user.name", "Local Author"]);
+    await exec("git", ["-C", root, "config", "user.email", "local@example.test"]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource({ accountHome }), { mode: 0o700 });
+    // Managed environment nulls the global config and redirects HOME, like an agent run.
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: "", token: "" }),
+      HOME: path.join(root, "agent-home"), PATH: `${bin}:${process.env.PATH}` };
+    await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Managed work"], { cwd: root, env });
+    const commit = (await exec("git", ["cat-file", "commit", "HEAD"], { cwd: root })).stdout;
+    expect(/^gpgsig /m.test(commit)).toBe(signing);
+  }, 15_000);
 });
