@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -11,20 +11,127 @@ const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
 describe("managed GitHub launchers", () => {
+
+  it("uses a private interpreter without selecting Node from PATH", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-interpreter-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const managed = path.join(root, "managed"), real = path.join(root, "real");
+    await mkdir(managed); await mkdir(real);
+    const source = githubLauncherSource({ interpreterPath: process.execPath });
+    const defaultSource = githubLauncherSource();
+    expect(defaultSource.split("\n")[0]).toBe("#!/usr/bin/env node");
+    expect(source.split("\n")[0]).toBe(`#!${process.execPath}`);
+    expect(source.slice(source.indexOf("\n"))).toBe(defaultSource.slice(defaultSource.indexOf("\n")));
+    const launcher = path.join(managed, "git");
+    await writeFile(launcher, source, { mode: 0o700 });
+    await writeFile(path.join(real, "node"), "#!/bin/sh\nexit 126\n", { mode: 0o700 });
+    await writeFile(path.join(real, "git"), "#!/bin/sh\nprintf 'private interpreter works'\n", { mode: 0o700 });
+    const env = { ...githubBrokerEnvironment({}, { url: "", token: "" }), HOME: root,
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${managed}${path.delimiter}${real}` };
+    expect((await exec(launcher, ["--version"], { env })).stdout).toBe("private interpreter works");
+  });
+
+  it.each(["", "relative/node", "/runtime/node --flag", "/runtime/node\nexit 1", "/runtime/node\0"])(
+    "rejects an invalid interpreter path %j", interpreterPath => {
+      expect(() => githubLauncherSource({ interpreterPath })).toThrow("absolute path without whitespace");
+    },
+  );
+  it.each([false, true])("rejects a PATH shim that re-enters the same helper before it can recurse (broker file: %s)", async brokerFile => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-recursion-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const managed = path.join(root, "managed"), shim = path.join(root, "shim"), calls = path.join(root, "calls");
+    await mkdir(managed); await mkdir(shim);
+    const launcher = path.join(managed, "git");
+    await writeFile(launcher, githubLauncherSource({ brokerFile }), { mode: 0o700 });
+    // Bound the pre-fix reproduction: the fixture stops at three invocations.
+    await writeFile(path.join(shim, "git"), `#!${process.execPath}
+const fs = require("node:fs"), {spawnSync} = require("node:child_process");
+fs.appendFileSync(${JSON.stringify(calls)}, "call\\n");
+if (fs.readFileSync(${JSON.stringify(calls)}, "utf8").trim().split("\\n").length >= 3) process.exit(99);
+const result = spawnSync(${JSON.stringify(launcher)}, process.argv.slice(2), {env: process.env, stdio: "inherit"});
+process.exit(result.status ?? 98);
+`, { mode: 0o700 });
+    const env = { ...process.env, ...githubBrokerEnvironment({}, {url: "", token: ""}),
+      PATH: `${managed}${path.delimiter}${shim}${path.delimiter}${path.dirname(process.execPath)}${path.delimiter}/usr/bin${path.delimiter}/bin` };
+    await expect(exec(launcher, ["--version"], {env, timeout: 5000})).rejects.toMatchObject({
+      code: 126, stderr: expect.stringContaining("launcher_recursion_rejected"),
+    });
+    expect((await readFile(calls, "utf8")).trim().split("\n")).toEqual(["call"]);
+  });
+
+  it("snapshots a staged tree and reports unstaged files without capturing GitHub credentials", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-snapshot-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), repo = path.join(root, "repo");
+    await mkdir(bin); await mkdir(repo);
+    await exec("git", ["init", "-q", repo]);
+    await writeFile(path.join(repo, "tracked.txt"), "staged contents\n");
+    await exec("git", ["-C", repo, "add", "tracked.txt"]);
+    const expectedTree = (await exec("git", ["-C", repo, "write-tree"])).stdout;
+    await writeFile(path.join(repo, "tracked.txt"), "unstaged contents\n");
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    let captures = 0;
+    const server = createServer((_req, res) => {
+      captures++;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "unavailable", reason: "No GitHub connection" }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }), PATH: `${bin}:${process.env.PATH}` };
+    const git = (...args: string[]) => exec(path.join(bin, "git"), args, { cwd: root, env });
+    const tree = await git("--git-dir", path.join(repo, ".git"), "--work-tree", repo, "write-tree");
+    const diff = await git("-C", repo, "-c", "core.quotepath=false", "diff-files", "--name-only", "-z", "--", ".");
+    expect(tree.stdout).toBe(expectedTree);
+    expect(diff.stdout).toBe("tracked.txt\0");
+    expect(captures).toBe(0);
+  });
+
+  it.each(["missing", "absent", "unavailable", "rejected"])("commits local work without an identity when GitHub access is %s", async (access) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-default-author-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await exec("git", ["init", root]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    const server = createServer((_req, res) => {
+      res.writeHead(access === "rejected" ? 403 : 200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: access, env: {
+        GH_TOKEN: "rejected-token", GIT_AUTHOR_NAME: "Rejected", GIT_AUTHOR_EMAIL: "rejected@example.test",
+        GIT_COMMITTER_NAME: "Rejected", GIT_COMMITTER_EMAIL: "rejected@example.test",
+      } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({
+      GH_TOKEN: "host-token", GIT_AUTHOR_NAME: "Host", GIT_AUTHOR_EMAIL: "host@example.test",
+      GIT_COMMITTER_NAME: "Host", GIT_COMMITTER_EMAIL: "host@example.test",
+    }, { url: `http://127.0.0.1:${port}`, token: access === "missing" ? "" : "run-capability" }),
+      PATH: `${bin}:${process.env.PATH}` };
+    await writeFile(path.join(root, "work.txt"), "saved work\n");
+    await exec(path.join(bin, "git"), ["add", "work.txt"], { cwd: root, env });
+    await exec(path.join(bin, "git"), ["commit", "-m", "Save local work"], { cwd: root, env });
+    expect((await exec("git", ["-C", root, "log", "-1", "--format=%an <%ae>|%cn <%ce>"])).stdout.trim())
+      .toBe("Paperclip <noreply@paperclip.ing>|Paperclip <noreply@paperclip.ing>");
+    expect((await exec("git", ["-C", root, "show", "HEAD:work.txt"])).stdout).toBe("saved work\n");
+    await expect(exec("git", ["-C", root, "config", "--local", "--get", "user.name"])).rejects.toThrow();
+    await expect(exec("git", ["-C", root, "config", "--local", "--get", "user.email"])).rejects.toThrow();
+  });
   it.each(["repository", "command"])("uses explicit %s identity for local commits without managed credentials", async (identitySource) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-local-identity-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const bin = path.join(root, "managed");
     await mkdir(bin);
     await exec("git", ["init", root]);
-    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(bin, "git"), githubLauncherSource({ accountHome: path.join(root, "account") }), { mode: 0o700 });
     const env = { ...process.env, ...githubBrokerEnvironment({
       GH_TOKEN: "host-token", GIT_AUTHOR_NAME: "Host", GIT_COMMITTER_NAME: "Host",
     }, { url: "", token: "" }), PATH: `${bin}:${process.env.PATH}` };
     const git = async (...args: string[]) => (await exec(path.join(bin, "git"), args, { cwd: root, env })).stdout.trim();
-    // No configured identity must fail, rather than guessing the host user's.
-    await expect(git("var", "GIT_AUTHOR_IDENT")).rejects.toThrow();
-    await expect(git("var", "GIT_COMMITTER_IDENT")).rejects.toThrow();
+    expect(await git("var", "GIT_AUTHOR_IDENT")).toMatch(/^Paperclip <noreply@paperclip.ing>/);
+    expect(await git("var", "GIT_COMMITTER_IDENT")).toMatch(/^Paperclip <noreply@paperclip.ing>/);
     if (identitySource === "repository") {
       await git("config", "user.name", "Local Author");
       await git("config", "user.email", "local@example.test");
@@ -43,7 +150,7 @@ describe("managed GitHub launchers", () => {
     await exec("git", ["init", root]);
     await exec("git", ["-C", root, "config", "user.name", "Local Author"]);
     await exec("git", ["-C", root, "config", "user.email", "local@example.test"]);
-    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(bin, "git"), githubLauncherSource({ accountHome: path.join(root, "account") }), { mode: 0o700 });
     const server = createServer((_req, res) => { res.writeHead(403); res.end(); });
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     const { port } = server.address() as { port: number };
@@ -51,7 +158,7 @@ describe("managed GitHub launchers", () => {
     else cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
     const configRoot = path.join(root, "config");
     if (failure === "config-unwritable") await writeFile(configRoot, "not a directory");
-    const result = await exec(path.join(bin, "git"), ["status", "--porcelain"], { cwd: root, env: {
+    const result = await exec(path.join(bin, "git"), ["remote"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
@@ -68,7 +175,7 @@ describe("managed GitHub launchers", () => {
     cleanups.push(() => rm(root, {recursive:true,force:true}));
     const bin = path.join(root,"managed"), realBin = path.join(root,"real");
     await mkdir(bin); await mkdir(realBin);
-    await writeFile(path.join(bin,"gh"), githubLauncherSource(), {mode:0o700});
+    await writeFile(path.join(bin,"gh"), githubLauncherSource({ accountHome: path.join(root, "account") }), {mode:0o700});
     await writeFile(path.join(realBin,"gh"), '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({token:process.env.GH_TOKEN ?? null}));', {mode:0o700});
     const server = createServer((_req,res) => {
       res.setHeader("content-type","application/json");
@@ -82,6 +189,44 @@ describe("managed GitHub launchers", () => {
     expect(result.stderr).toContain("More than one managed GitHub identity matches this run");
     expect(result.stderr).not.toMatch(/host-token|must-not-be-used|run-capability/);
   });
+  it.each(["before-write", "partial-write"])("keeps Git and managed credentials available after a %s failure", async (failure) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-default-write-failure-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), realBin = path.join(root, "real");
+    await mkdir(bin); await mkdir(realBin);
+    await exec("git", ["init", root]);
+    for (const name of ["git", "gh"]) await writeFile(path.join(bin, name), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(realBin, "gh"), '#!/usr/bin/env node\nprocess.stdout.write(process.env.GH_TOKEN || "anonymous");', { mode: 0o700 });
+    const fault = path.join(root, "write-fault.cjs");
+    await writeFile(fault, `const fs = require('node:fs'); const write = fs.writeFileSync;
+fs.writeFileSync = (file, ...args) => {
+  if (String(file).endsWith('/gitconfig')) {
+    if (${failure === "partial-write"}) write(file, '[user', { mode: 0o600 });
+    throw new Error('fixture disk full');
+  }
+  return write(file, ...args);
+};`);
+    const server = createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "managed-token" } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = {
+      ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
+      PATH: `${bin}:${realBin}:${process.env.PATH}`,
+    };
+    const result = await exec(process.execPath, ["--require", fault, path.join(bin, "gh")], { cwd: root, env });
+    expect(result.stdout).toBe("managed-token");
+    expect(result.stderr).toContain("configuration_directory_unavailable");
+    const git = (...args: string[]) => exec(process.execPath, ["--require", fault, path.join(bin, "git"), ...args], { cwd: root, env });
+    expect((await git("status", "--porcelain", "--untracked-files=no")).stdout).toBe("");
+    await expect(git("commit", "--allow-empty", "-m", "No default")).rejects.toMatchObject({ stderr: expect.stringContaining("Author identity unknown") });
+    await git("-c", "user.name=Explicit", "-c", "user.email=explicit@example.test", "commit", "--allow-empty", "-m", "Explicit identity");
+    expect((await exec("git", ["-C", root, "log", "-1", "--format=%an <%ae>|%cn <%ce>"])).stdout.trim())
+      .toBe("Explicit <explicit@example.test>|Explicit <explicit@example.test>");
+  });
   // The first broker request fails, the second succeeds: the managed token must still reach gh.
   it.each([
     ["connection drops before the response", (res: import("node:http").ServerResponse) => { res.socket?.destroy(); }],
@@ -93,7 +238,7 @@ describe("managed GitHub launchers", () => {
     cleanups.push(() => rm(root, {recursive:true,force:true}));
     const bin = path.join(root,"managed"), realBin = path.join(root,"real");
     await mkdir(bin); await mkdir(realBin);
-    await writeFile(path.join(bin,"gh"), githubLauncherSource(), {mode:0o700});
+    await writeFile(path.join(bin,"gh"), githubLauncherSource({ accountHome: path.join(root, "account") }), {mode:0o700});
     await writeFile(path.join(realBin,"gh"), '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({token:process.env.GH_TOKEN ?? null}));', {mode:0o700});
     let requests = 0;
     const server = createServer((_req,res) => {
@@ -116,7 +261,7 @@ describe("managed GitHub launchers", () => {
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const bin = path.join(root, "managed"), realBin = path.join(root, "real"), repo = path.join(root, "repo");
     for (const dir of [bin, realBin, repo, path.join(bin, "gh-config")]) await mkdir(dir, { recursive: true });
-    for (const name of ["git", "gh"]) await writeFile(path.join(bin, name), githubLauncherSource(), { mode: 0o700 });
+    for (const name of ["git", "gh"]) await writeFile(path.join(bin, name), githubLauncherSource({ accountHome: path.join(root, "account") }), { mode: 0o700 });
     await writeFile(path.join(realBin, "gh"), `#!/usr/bin/env node
 const {execFileSync}=require('node:child_process');
 const identity=execFileSync('git',['var','GIT_AUTHOR_IDENT'],{encoding:'utf8'}).trim();
@@ -177,9 +322,216 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(anonymous.token).toBeNull();
     await git("config", "--unset", "user.name");
     await git("config", "--unset", "user.email");
-    await expect(git("var", "GIT_AUTHOR_IDENT")).rejects.toThrow();
+    await git("commit", "--allow-empty", "-m", "Default identity after revocation");
+    expect(await git("log", "-1", "--format=%an <%ae>|%cn <%ce>"))
+      .toBe("Paperclip <noreply@paperclip.ing>|Paperclip <noreply@paperclip.ing>");
     expect(await git("status", "--porcelain")).toBe(""); // unrelated public/local Git still works
     expect(env.GH_TOKEN).toBe("");
     expect(env.GIT_AUTHOR_NAME).toBe("");
   });
+
+  it.each([true, false])("applies the account's commit-signing config to managed Git (signing enabled: %s)", async (signing) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-signing-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const accountHome = path.join(root, "account");
+    const bin = path.join(root, "managed");
+    await mkdir(path.join(accountHome, ".ssh"), { recursive: true });
+    await mkdir(bin);
+    const key = path.join(accountHome, ".ssh", "id_ed25519");
+    await exec("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", key]);
+    // The account config names the PUBLIC key, as ssh-agent users do; the agent is not inherited.
+    await writeFile(path.join(accountHome, ".gitconfig"), signing
+      ? `[commit]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = ${key}.pub\n`
+      : "[user]\n\tname = Account\n");
+    await exec("git", ["init", root]);
+    await exec("git", ["-C", root, "config", "user.name", "Local Author"]);
+    await exec("git", ["-C", root, "config", "user.email", "local@example.test"]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource({ accountHome }), { mode: 0o700 });
+    // Managed environment nulls the global config and redirects HOME, like an agent run.
+    // The launcher reads Git settings from XDG_CONFIG_HOME too: pin it so a developer's own
+    // signing setup cannot turn the unsigned case into a signed one.
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: "", token: "" }),
+      HOME: path.join(root, "agent-home"), XDG_CONFIG_HOME: path.join(root, "xdg-empty"), PATH: `${bin}:${process.env.PATH}` };
+    await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Managed work"], { cwd: root, env });
+    const commit = (await exec("git", ["cat-file", "commit", "HEAD"], { cwd: root })).stdout;
+    expect(/^gpgsig /m.test(commit)).toBe(signing);
+  }, 15_000);
+
+  describe("account commit-signing edge cases", () => {
+    async function signingFixture() {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-signing-edge-"));
+      cleanups.push(() => rm(root, { recursive: true, force: true }));
+      const accountHome = path.join(root, "account");
+      const bin = path.join(root, "managed");
+      const repo = path.join(root, "repo");
+      await mkdir(path.join(accountHome, ".ssh"), { recursive: true });
+      await mkdir(bin);
+      const key = path.join(accountHome, ".ssh", "id_ed25519");
+      await exec("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", key]);
+      await exec("git", ["init", repo]);
+      await exec("git", ["-C", repo, "config", "user.name", "Local Author"]);
+      await exec("git", ["-C", repo, "config", "user.email", "local@example.test"]);
+      await writeFile(path.join(bin, "git"), githubLauncherSource({ accountHome }), { mode: 0o700 });
+      // Managed environment nulls the global config and redirects HOME, like an agent run.
+      const env = { ...process.env, ...githubBrokerEnvironment({}, { url: "", token: "" }),
+        HOME: path.join(root, "agent-home"), XDG_CONFIG_HOME: path.join(root, "xdg-empty"),
+        PATH: `${bin}:${process.env.PATH}` };
+      const git = (args: string[], cwd = repo, extra: NodeJS.ProcessEnv = {}) =>
+        exec(path.join(bin, "git"), args, { cwd, env: { ...env, ...extra } });
+      const signed = async () => /^gpgsig /m.test((await exec("git", ["-C", repo, "cat-file", "commit", "HEAD"])).stdout);
+      return { root, accountHome, bin, repo, key, git, signed, env };
+    }
+    const signingConfig = (key: string, gpgsign: string) =>
+      `[commit]\n\tgpgsign${gpgsign}\n[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = ${key}.pub\n`;
+
+    it("treats a commit.gpgsign key written without a value as true", async () => {
+      const { accountHome, key, git, signed } = await signingFixture();
+      await writeFile(path.join(accountHome, ".gitconfig"), signingConfig(key, ""));
+      await git(["commit", "--allow-empty", "-m", "Managed work"]);
+      expect(await signed()).toBe(true);
+    }, 15_000);
+
+    it("keeps the managed default author when the account signs and the repository has no identity", async () => {
+      const { accountHome, repo, key, git, signed } = await signingFixture();
+      await writeFile(path.join(accountHome, ".gitconfig"), signingConfig(key, " = true"));
+      await exec("git", ["-C", repo, "config", "--unset", "user.name"]);
+      await exec("git", ["-C", repo, "config", "--unset", "user.email"]);
+      await git(["commit", "--allow-empty", "-m", "Managed work"]);
+      expect(await signed()).toBe(true);
+      expect((await exec("git", ["-C", repo, "log", "-1", "--format=%an <%ae>"])).stdout.trim())
+        .toBe("Paperclip <noreply@paperclip.ing>");
+    }, 15_000);
+
+    it.each([["false", "true", false], ["true", "false", true]])(
+      "lets repository commit.gpgsign=%s win over the account's commit.gpgsign=%s", async (repoValue, accountValue, expected) => {
+        const { accountHome, repo, key, git, signed } = await signingFixture();
+        await writeFile(path.join(accountHome, ".gitconfig"), signingConfig(key, ` = ${accountValue}`));
+        await exec("git", ["-C", repo, "config", "commit.gpgsign", repoValue]);
+        await git(["commit", "--allow-empty", "-m", "Managed work"]);
+        expect(await signed()).toBe(expected);
+      }, 15_000);
+
+    it("evaluates includeIf rules in the repository selected with git -C", async () => {
+      const { accountHome, repo, key, git, signed } = await signingFixture();
+      await writeFile(path.join(accountHome, "signing.inc"), signingConfig(key, " = true"));
+      await writeFile(path.join(accountHome, ".gitconfig"), `[includeIf "gitdir:${repo}/"]\n\tpath = ~/signing.inc\n`);
+      await git(["-C", repo, "commit", "--allow-empty", "-m", "Managed work"], accountHome);
+      expect(await signed()).toBe(true);
+    }, 15_000);
+
+    it("reads the account config from a custom XDG_CONFIG_HOME", async () => {
+      const { root, key, git, signed } = await signingFixture();
+      const xdg = path.join(root, "xdg-account");
+      await mkdir(path.join(xdg, "git"), { recursive: true });
+      await writeFile(path.join(xdg, "git", "config"), signingConfig(key, " = true"));
+      await git(["commit", "--allow-empty", "-m", "Managed work"], undefined, { XDG_CONFIG_HOME: xdg });
+      expect(await signed()).toBe(true);
+    }, 15_000);
+
+    it("refuses to create commits when the account signing policy cannot be read", async () => {
+      const { accountHome, repo, git } = await signingFixture();
+      await writeFile(path.join(accountHome, ".gitconfig"), "[commit\n");
+      await expect(git(["commit", "--allow-empty", "-m", "Managed work"])).rejects.toThrow(/signing configuration/);
+      await exec("git", ["-C", repo, "config", "alias.ci", "commit"]);
+      await expect(git(["ci", "--allow-empty", "-m", "Managed work"])).rejects.toThrow(/signing configuration/);
+      await expect(exec("git", ["-C", repo, "rev-parse", "--verify", "HEAD"])).rejects.toThrow();
+      expect((await git(["status", "--porcelain"])).stdout).toBe(""); // commands that create no objects still work
+      // Snapshot plumbing creates no commit or tag, so an unreadable policy must not block it.
+      await git(["symbolic-ref", "HEAD"]);
+      await git(["write-tree"]);
+      await git(["diff-files", "--quiet"]);
+    }, 15_000);
+
+    it("points OpenPGP signing at the account's GnuPG home", async () => {
+      const { root, accountHome, bin, repo, env } = await signingFixture();
+      await mkdir(path.join(accountHome, ".gnupg"));
+      await writeFile(path.join(accountHome, ".gitconfig"), "[commit]\n\tgpgsign = true\n");
+      // A stand-in Git that only reports what the launcher exported; config lookups reach real Git.
+      const stub = path.join(root, "stub");
+      await mkdir(stub);
+      const realGit = (await exec("sh", ["-c", "command -v git"])).stdout.trim();
+      await writeFile(path.join(stub, "git"), `#!/bin/sh\ncase " $* " in *" config "*) exec ${realGit} "$@";; esac\necho "GNUPGHOME=$GNUPGHOME"\n`, { mode: 0o700 });
+      const hermetic: NodeJS.ProcessEnv = { ...env };
+      delete hermetic.GNUPGHOME; // do not inherit the developer's GnuPG home
+      const run = (extra: NodeJS.ProcessEnv) => exec(path.join(bin, "git"), ["version"],
+        { cwd: repo, env: { ...hermetic, PATH: `${bin}:${stub}:${process.env.PATH}`, ...extra } });
+      expect((await run({})).stdout.trim()).toBe(`GNUPGHOME=${path.join(accountHome, ".gnupg")}`);
+      // An explicit GnuPG home is the account's choice and is never replaced.
+      expect((await run({ GNUPGHOME: "/explicit/gnupg" })).stdout.trim()).toBe("GNUPGHOME=/explicit/gnupg");
+    }, 15_000);
+  });
+  it("keeps local Git commands off the broker and still asks for the rest", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-local-skip-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    let posts = 0;
+    const server = createServer((_req, res) => {
+      posts++;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: {
+        GH_TOKEN: "managed-token", GIT_AUTHOR_NAME: "Managed", GIT_AUTHOR_EMAIL: "managed@example.test",
+        GIT_COMMITTER_NAME: "Managed", GIT_COMMITTER_EMAIL: "managed@example.test",
+      } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }), PATH: `${bin}:${process.env.PATH}` };
+    const git = async (...args: string[]) => {
+      const before = posts;
+      const { stdout } = await exec(path.join(bin, "git"), args, { cwd: root, env }).catch(() => ({ stdout: "" }));
+      return { stdout: stdout.trim(), posts: posts - before };
+    };
+    for (const args of [
+      ["init", "-q", "repo"],
+      ["-C", "repo", "status", "--short"],
+      ["-C", "repo", "-c", "core.quotepath=off", "--no-pager", "diff"],
+      ["--git-dir=repo/.git", "rev-parse", "--git-dir"],
+      ["--git-dir", "repo/.git", "--work-tree", "repo", "status"],
+      ["-C", "repo", "config", "user.useConfigOnly"],
+      ["--version"],
+    ]) expect((await git(...args)).posts, args.join(" ")).toBe(0);
+    expect((await git("-C", "repo", "config", "user.useConfigOnly")).stdout).toBe("true");
+    for (const args of [
+      ["-C", "repo", "remote"],
+      ["-C", "repo", "var", "GIT_AUTHOR_IDENT"],
+      ["-C", "repo", "fetch", "--dry-run"],
+      ["-C", "repo", "-c", "alias.noop=!true", "noop"],
+      ["-C", "repo", "--unknown-option", "status"],
+      ["-C"],
+    ]) expect((await git(...args)).posts, args.join(" ")).toBe(1);
+    expect((await git("-C", "repo", "var", "GIT_AUTHOR_IDENT")).stdout).toMatch(/^Managed <managed@example.test>/);
+    expect((await git("-C", "repo", "commit", "--allow-empty", "-m", "Managed work")).posts).toBe(1);
+    expect((await git("-C", "repo", "log", "-1", "--format=%an <%ae>")).stdout).toBe("Managed <managed@example.test>");
+  }, 20_000);
+});
+
+it("captures the current task broker file once per invocation and never falls back to inherited authority", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-task-github-"));
+  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  const bin = path.join(root, "managed"), real = path.join(root, "real");
+  await mkdir(bin); await mkdir(real);
+  await writeFile(path.join(bin, "gh"), githubLauncherSource({ brokerFile: true }), { mode: 0o700 });
+  await writeFile(path.join(real, "gh"), '#!/usr/bin/env node\nprocess.stdout.write(process.env.GH_TOKEN || "anonymous");\n', { mode: 0o700 });
+  const captured: string[] = [];
+  const server = createServer((req, res) => {
+    captured.push(req.headers.authorization!);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: req.headers.authorization!.slice(7) + "-credential" } }));
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const env = { ...process.env, PATH: `${bin}:${real}:${process.env.PATH}`, GH_TOKEN: "ambient-secret",
+    PAPERCLIP_GITHUB_BROKER_URL: url, PAPERCLIP_GITHUB_BROKER_TOKEN: "stale-capability", PAPERCLIP_API_KEY: "unrelated-api-key" };
+  const run = () => exec(path.join(bin, "gh"), [], { env });
+  for (const token of ["first-run", "next-run"]) {
+    await writeFile(path.join(bin, "broker.json"), JSON.stringify({ url, token }));
+    expect((await run()).stdout).toBe(token + "-credential");
+  }
+  await rm(path.join(bin, "broker.json"));
+  expect((await run()).stdout).toBe("anonymous");
+  expect(captured).toEqual(["Bearer first-run", "Bearer next-run"]);
 });
